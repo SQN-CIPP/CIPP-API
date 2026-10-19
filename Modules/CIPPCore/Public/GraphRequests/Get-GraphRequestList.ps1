@@ -92,6 +92,13 @@ function Get-GraphRequestList {
     $Endpoint = $Endpoint -replace '^/', ''
     $DisplayName = ($Endpoint -split '/')[0]
 
+    # @odata.count is only returned when the request carries $count=true, so a CountOnly caller
+    # that did not also pass $count got a response with no count and CountOnly returned $null.
+    # Add it here (ConsistencyLevel:eventual is set via ComplexFilter on the count request below).
+    if ($CountOnly.IsPresent -and -not $Parameters.ContainsKey('$count')) {
+        $Parameters['$count'] = 'true'
+    }
+
     if ($QueueNameOverride) {
         $QueueName = $QueueNameOverride
     } else {
@@ -137,6 +144,10 @@ function Get-GraphRequestList {
         }
     }
     $GraphQuery.Query = $ParamCollection.ToString()
+    Test-CIPPGraphEndpointBlocked -Uri $GraphQuery.ToString() -Expand $BatchExpandQuery -Throw
+    if ($nextLink -match '^https://') {
+        Test-CIPPGraphEndpointBlocked -Uri $nextLink -Throw
+    }
     $PartitionKey = Get-StringHash -String (@($Endpoint, $ParamCollection.ToString(), 'v2') -join '-')
 
     # Perform $count check before caching
@@ -180,6 +191,7 @@ function Get-GraphRequestList {
             }
             $GraphQuery.Query = $ParamCollection.ToString()
             $GraphRequest.uri = $GraphQuery.ToString()
+            Test-CIPPGraphEndpointBlocked -Uri $GraphRequest.uri -Throw
         }
 
         if ($Parameters.'$count' -and -not $ManualPagination.IsPresent) {
@@ -498,10 +510,15 @@ function Get-GraphRequestList {
                     $SpanFilter = "PartitionKey eq '{0}' and RowKey ge '{1}' and RowKey le '{2}~' and Timestamp ge datetime'{3}'" -f $PartitionKey, $SpanFirst, $SpanLast, $Timestamp
                     # Budget is enforced per whole tenant; the rest of a span past it is discarded
                     # and re-fetched by the next page.
+                    $SpanData = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
                     foreach ($Row in @(Get-CIPPAzDataTableEntity @Table -Filter $SpanFilter)) {
-                        if (-not $SpanSet.Contains([string]$Row.RowKey)) { continue }
-                        if ($BudgetReached) { break }
-                        $LastEmitted = [string]$Row.RowKey
+                        if ($SpanSet.Contains([string]$Row.RowKey)) { $SpanData[[string]$Row.RowKey] = $Row }
+                    }
+                    # Emit in plan order: the store's row order is not ordinal (Azurite), and the token resumes by plan order.
+                    for ($SpanIndex = $SpanStart; $SpanIndex -lt $Index -and -not $BudgetReached; $SpanIndex++) {
+                        $LastEmitted = $Remaining[$SpanIndex]
+                        $Row = $null
+                        if (-not $SpanData.TryGetValue($LastEmitted, [ref]$Row)) { continue }
                         if ($Row.Data) {
                             $d = $Row.Data.Trim()
                             if ($d.Length -gt 2 -and $d[0] -eq '[' -and $d[-1] -eq ']') {
